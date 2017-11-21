@@ -1,0 +1,186 @@
+#!/usr/bin/make -f
+
+include /usr/share/gnome-pkg-tools/1/rules/gnome-get-source.mk
+
+GNOME_MODULE := glib
+binaries := $(shell dh_listpackages)
+
+export DEB_BUILD_MAINT_OPTIONS=hardening=+bindnow
+
+# Ensure the build aborts when there are still references to undefined symbols
+DEB_LDFLAGS_MAINT_APPEND += -Wl,-z,defs
+
+# NB: do NOT use -Wl,--as-needed to build glib; for instance the link to
+# pthread is carefully crafted to allow dlopen()ing pthread-using libs; see
+# http://mid.gmane.org/1257999019.21780.15.camel@marzipan
+DEB_LDFLAGS_MAINT_APPEND += -Wl,--no-as-needed
+
+# Make the linker work a bit harder so dynamic loading can be done faster
+DEB_LDFLAGS_MAINT_APPEND += -Wl,-O1
+
+include /usr/share/dpkg/default.mk
+
+%:
+	dh $@ --with gnome,python3
+
+override_dh_auto_configure:
+	dh_auto_configure \
+		--builddirectory=debian/build/deb \
+		-- \
+		$(DEB_CONFIGURE_EXTRA_FLAGS) \
+		$(DEB_CONFIGURE_FLAGS_deb) \
+		$(NULL)
+ifneq ($(filter %-udeb,$(binaries)),)
+	dh_auto_configure \
+		--builddirectory=debian/build/udeb \
+		-- \
+		$(DEB_CONFIGURE_EXTRA_FLAGS) \
+		$(DEB_CONFIGURE_FLAGS_udeb) \
+		$(NULL)
+endif
+
+override_dh_clean:
+	rm -rf $(CURDIR)/debian/build \
+	       $(CURDIR)/debian/install \
+	       $(CURDIR)/debian/tmp-xdg-runtime-dir
+	dh_clean -Xorg.gtk.test.gschema.xml.orig
+
+override_dh_makeshlibs:
+	dh_makeshlibs -plibglib2.0-tests -n
+	dh_makeshlibs --remaining-packages -V --add-udeb=libglib2.0-udeb -- -c4
+
+override_dh_strip:
+	dh_strip --dbgsym-migration='libglib2.0-0-dbg (<< 2.51.4-1~)'
+
+# (Ubuntu-specific)
+# Don't strip translations from the installed tests; makes them environment dependent.
+override_dh_translations:
+	dh_translations -Xinstalled-tests
+
+# Do not clutter $HOME with ~/.dbus-keyrings and avoid failure on the buildds
+# where creating /home/buildd/.dbus-keyrings fails
+export HOME=$(CURDIR)/debian/build
+
+# Put these back to their defaults if we are not running with a clean
+# environment, so that they are based on the temporary $HOME above.
+# Otherwise, some tests would try to write to the user's real XDG_DATA_HOME,
+# causing unwanted side-effects or FTBFS depending whether the user's
+# real HOME is available in the build chroot (if used)
+unexport XDG_CACHE_HOME
+unexport XDG_CONFIG_DIRS
+unexport XDG_CONFIG_HOME
+unexport XDG_DATA_HOME
+unexport XDG_DATA_DIRS
+
+# Make sure that everything that uses D-Bus is creating its own temporary
+# session rather than polluting the developer's (or failing, on buildds)
+export DBUS_SESSION_BUS_ADDRESS=this-should-not-be-used-and-will-fail:
+
+ifeq ($(DEB_HOST_ARCH_OS), linux)
+override_dh_auto_test-arch:
+	# Remove LD_PRELOAD so we don't run with fakeroot, which makes dbus-related tests fail
+	env -u LD_PRELOAD dh_auto_test --builddirectory=debian/build/deb -- -k check -j1
+else
+override_dh_auto_test-arch:
+	env -u LD_PRELOAD dh_auto_test --builddirectory=debian/build/deb -- -k check -j1 || true
+endif
+
+# Skip build-time tests if all we are building is documentation; running
+# them once per architecture is plenty
+override_dh_auto_test-indep:
+	@:
+
+# The tests assume this directory exists and is writable
+export XDG_RUNTIME_DIR=$(CURDIR)/debian/tmp-xdg-runtime-dir
+# Let's get failing tests' stdout and stderr so we have some information when
+# a build fails
+export VERBOSE=1
+
+# configure flags
+DEB_CONFIGURE_EXTRA_FLAGS := \
+			--with-html-dir=\$${prefix}/share/doc/libglib2.0-doc \
+			--libexecdir=\$${prefix}/lib/glib2.0 \
+			--with-python=/usr/bin/python3 \
+			--with-pcre=system
+
+DEB_CONFIGURE_FLAGS_deb := \
+			--enable-static \
+			--enable-installed-tests \
+			--enable-always-build-tests \
+			--enable-debug=minimum
+
+ifneq ($(filter libglib2.0-doc,$(binaries)),)
+DEB_CONFIGURE_FLAGS_deb += --enable-gtk-doc
+else
+DEB_CONFIGURE_FLAGS_deb += --disable-gtk-doc
+endif
+
+# libmount is available on linux only
+ifeq ($(DEB_HOST_ARCH_OS), linux)
+  DEB_CONFIGURE_FLAGS_deb += \
+			--enable-libmount
+else
+  DEB_CONFIGURE_FLAGS_deb += \
+			--disable-libmount
+endif
+
+
+DEB_CONFIGURE_FLAGS_udeb := \
+			--disable-selinux \
+			--disable-libmount \
+			--disable-gtk-doc
+
+override_dh_auto_build:
+	mkdir -p debian/tmp-xdg-runtime-dir
+	dh_auto_build --builddirectory=debian/build/deb
+ifneq ($(filter %-udeb,$(binaries)),)
+	dh_auto_build --builddirectory=debian/build/udeb
+endif
+
+override_dh_auto_install:
+	set -e; for script in postinst postrm triggers; do \
+		sed -e"s/#MULTIARCH#/$(DEB_HOST_MULTIARCH)/g" \
+		    -e"s/#ARCH#/$(DEB_HOST_ARCH)/g" \
+		    debian/libglib2.0-0.$$script.in \
+		    > debian/libglib2.0-0.$$script ; \
+	done
+	dh_auto_install -plibglib2.0-tests --sourcedir=debian/build/deb
+ifneq ($(filter %-udeb,$(binaries)),)
+	dh_auto_install -plibglib2.0-udeb --builddirectory=debian/build/udeb --destdir=debian/install/udeb
+endif
+	dh_auto_install --remaining-packages --builddirectory=debian/build/deb --destdir=debian/install/deb
+
+override_dh_python3:
+	dh_python3 -plibglib2.0-dev-bin /usr/share/glib-2.0/codegen
+
+override_dh_install:
+	# Unwanted bits from the .deb build
+	rm -f debian/install/deb/lib/*/*.la
+	rm -f debian/install/deb/usr/lib/*/*.la
+	rm -f debian/install/deb/usr/lib/glib2.0/installed-tests/glib/*.la
+	rm -f debian/install/deb/usr/lib/glib2.0/installed-tests/glib/modules/*.la
+	rm -fr debian/install/deb/usr/share/glib-2.0/codegen/__pycache__
+	# Re-created by .links to point into /lib
+	rm -f debian/install/deb/usr/lib/*/libglib-2.0.so
+ifneq ($(filter %-udeb,$(binaries)),)
+	# Unwanted bits from the .udeb build
+	rm -f debian/install/udeb/lib/*/*.la
+	rm -f debian/install/udeb/usr/lib/*/*.la
+	rm -f debian/install/udeb/usr/lib/*/*.so
+	rm -fr debian/install/udeb/usr/share/gdb
+	rm -fr debian/install/udeb/usr/share/gettext/its
+	rm -fr debian/install/udeb/usr/share/glib-2.0/codegen
+	rm -fr debian/install/udeb/usr/share/glib-2.0/gdb
+	rm -fr debian/install/udeb/usr/share/glib-2.0/valgrind
+	rm -fr debian/install/udeb/usr/share/man
+	dh_install -plibglib2.0-udeb --sourcedir=debian/install/udeb
+endif
+	# Put the gdb script in .../gdb/auto-load/lib, as we install libglib*.so in there
+	mkdir -p debian/install/deb/usr/share/gdb/auto-load/lib/${DEB_HOST_MULTIARCH}/
+	mv debian/install/deb/usr/share/gdb/auto-load/usr/lib/${DEB_HOST_MULTIARCH}/libglib*so*py \
+		debian/install/deb/usr/share/gdb/auto-load/lib/${DEB_HOST_MULTIARCH}/
+	dh_install --remaining-packages --sourcedir=debian/install/deb
+
+override_dh_missing:
+	dh_missing --sourcedir=debian/install/udeb --fail-missing
+	dh_missing --sourcedir=debian/install/deb --fail-missing
